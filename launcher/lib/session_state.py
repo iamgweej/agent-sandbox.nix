@@ -1,23 +1,29 @@
 import os
 import re
-import select
 import shutil
 import signal
+import socket
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from launcher.lib.build_spec import ProxySpec, SandboxBuildSpec
+from launcher.lib.build_spec import ProxySpec, SandboxBuildSpec, SandboxBuildSpecLinux
 from launcher.lib.constants import (
-    CA_CERT,
     ERROR_PREFIX,
+    PASTA_GATEWAY_IP,
+    PRIVOXY_CONF,
+    PRIVOXY_LINUX_PORT,
     PROXY_LISTEN_HOST,
     PROXY_LOG,
     PROXY_STARTUP_TIMEOUT_SECONDS,
     SESSION_RETENTION,
+    SOCKD_CONF,
+    SOCKD_PID,
     STUB_PID,
+    WARN_PREFIX,
 )
 
 # Deliberately undocumented; used by the test suite. XDG_STATE_HOME is the
@@ -38,8 +44,14 @@ SANDBOX_TMPDIR_NAME = "tmp"
 
 @dataclass(frozen=True, kw_only=True)
 class ProxyState:
-    port: int
-    pid: int
+    # Where the sandbox reaches sockd: the pasta gateway on Linux, loopback
+    # on macOS. Both land on the host's 127.0.0.1:sockd_port.
+    sockd_host: str
+    sockd_port: int
+    # A process group leader: sockd forks its workers into the same group.
+    sockd_pid: int
+    # Privoxy's port on the sandbox's loopback.
+    privoxy_port: int
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -146,84 +158,185 @@ def remove_darwin_sandbox_dir(directory: Path) -> None:
     shutil.rmtree(directory, ignore_errors=True)
 
 
-def _start_proxy(proxy: ProxySpec, session_dir: Path) -> subprocess.Popen[str]:
-    environ = dict(os.environ)
-    pairs = [f"{host}={address}" for host, address in proxy.redirects.items()]
-    environ["SANDBOX_PROXY_REDIRECT"] = ",".join(pairs)
+def _pick_free_port() -> int:
+    # Racy by nature: the port is free now, not necessarily when sockd or
+    # Privoxy binds it. A lost race fails the launch loudly, never silently.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind((PROXY_LISTEN_HOST, 0))
+        return int(probe.getsockname()[1])
 
-    log = (session_dir / PROXY_LOG).open("a", encoding="utf-8")
-    argv = [
-        str(proxy.binary),
-        str(proxy.allowlist_file),
-        str(session_dir / CA_CERT),
-        PROXY_LISTEN_HOST,
+
+def _get_default_interface_linux() -> str | None:
+    try:
+        lines = Path("/proc/net/route").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in lines[1:]:
+        fields = line.split()
+        if len(fields) > 1 and fields[1] == "00000000":
+            return fields[0]
+    return None
+
+
+def _get_default_interface_darwin() -> str | None:
+    try:
+        result = subprocess.run(
+            ["/sbin/route", "-n", "get", "default"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    for line in result.stdout.splitlines():
+        key, _, value = line.strip().partition(":")
+        if key == "interface" and value.strip():
+            return value.strip()
+    return None
+
+
+def _get_external_interface(is_linux: bool) -> str:
+    """The interface sockd connects out from. sockd refuses a wildcard
+    address, and refuses outright any listed interface that has no address,
+    so it gets the default route's."""
+    if is_linux:
+        interface = _get_default_interface_linux()
+        loopback = "lo"
+    else:
+        interface = _get_default_interface_darwin()
+        loopback = "lo0"
+    if interface is not None:
+        return interface
+    # Offline: sockd still has to start, so every allowed CONNECT fails
+    # instead of the launch.
+    print(
+        f"{WARN_PREFIX} no default route; allowed domains will be unreachable "
+        f"until the next launch",
+        file=sys.stderr,
+    )
+    return loopback
+
+
+def _write_sockd_conf(
+    proxy: ProxySpec, session_dir: Path, port: int, external: str
+) -> Path:
+    # resolveprotocol: fake is load-bearing. Without it, a request carrying
+    # an IP address (ATYP 0x01) is matched against the domain rules by
+    # reverse-resolving it, which trusts whoever controls the PTR record.
+    header = [
+        f"logoutput: {session_dir / PROXY_LOG}",
+        f"internal: {PROXY_LISTEN_HOST} port = {port}",
+        f"external: {external}",
+        "resolveprotocol: fake",
+        "clientmethod: none",
+        "socksmethod: none",
+        # Loopback-only listener, so every client is already local. Not
+        # logged: the launcher's readiness probe would read as a block.
+        "client pass {",
+        "  from: 0/0 to: 0/0",
+        "}",
     ]
+    rules = proxy.dante_rules_file.read_text(encoding="utf-8")
+    path = session_dir / SOCKD_CONF
+    path.write_text("\n".join(header) + "\n" + rules, encoding="utf-8")
+    return path
+
+
+def _write_privoxy_conf(
+    session_dir: Path, listen_port: int, sockd_host: str, sockd_port: int
+) -> None:
+    # No actions or filters: Privoxy only translates. forward-socks5 (not 4a
+    # or 5t) with "." sends sockd the name, never a local resolution.
+    lines = [
+        f"listen-address 127.0.0.1:{listen_port}",
+        f"forward-socks5 / {sockd_host}:{sockd_port} .",
+        "toggle 0",
+        "enable-remote-toggle 0",
+        "enable-remote-http-toggle 0",
+        "enable-edit-actions 0",
+    ]
+    (session_dir / PRIVOXY_CONF).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _start_sockd(
+    proxy: ProxySpec, session_dir: Path, conf: Path
+) -> subprocess.Popen[bytes]:
+    # A session of its own, so the forked workers share a process group that
+    # one killpg takes down.
+    log = (session_dir / PROXY_LOG).open("ab")
+    argv = [str(proxy.sockd), "-f", str(conf), "-p", str(session_dir / SOCKD_PID)]
     return subprocess.Popen(
-        argv, stdout=subprocess.PIPE, stderr=log, text=True, env=environ
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=log,
+        start_new_session=True,
     )
 
 
-def _read_proxy_port(process: subprocess.Popen[str], session_dir: Path) -> int:
-    if process.stdout is None:
-        raise SystemExit(f"{ERROR_PREFIX} sandbox proxy stdout was not captured")
-
+def _wait_for_sockd(
+    process: subprocess.Popen[bytes], port: int, session_dir: Path
+) -> None:
     log = session_dir / PROXY_LOG
     deadline = time.monotonic() + PROXY_STARTUP_TIMEOUT_SECONDS
     while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise SystemExit(
-                f"{ERROR_PREFIX} sandbox proxy did not report a port within "
-                f"{PROXY_STARTUP_TIMEOUT_SECONDS:g}s (see {log})"
-            )
-        readable, _, _ = select.select([process.stdout], [], [], remaining)
-        if readable:
-            break
         if process.poll() is not None:
             raise SystemExit(
-                f"{ERROR_PREFIX} sandbox proxy exited with status "
-                f"{process.returncode} before reporting a port (see {log})"
+                f"{ERROR_PREFIX} sockd exited with status {process.returncode} "
+                f"before accepting connections (see {log})"
             )
-
-    # A dead child makes its pipe readable at EOF, so select above cannot
-    # tell that case from a port arriving. An empty line is that EOF.
-    reported = process.stdout.readline().strip()
-    if not reported:
-        if process.poll() is None:
+        try:
+            with socket.create_connection((PROXY_LISTEN_HOST, port), timeout=0.2):
+                return
+        except OSError:
+            pass
+        if time.monotonic() >= deadline:
             raise SystemExit(
-                f"{ERROR_PREFIX} sandbox proxy closed its output without reporting "
-                f"a port (see {log})"
+                f"{ERROR_PREFIX} sockd did not accept connections on port {port} "
+                f"within {PROXY_STARTUP_TIMEOUT_SECONDS:g}s (see {log})"
             )
-        raise SystemExit(
-            f"{ERROR_PREFIX} sandbox proxy exited with status {process.returncode} "
-            f"before reporting a port (see {log})"
-        )
-    if not re.fullmatch(r"[0-9]+", reported):
-        raise SystemExit(
-            f"{ERROR_PREFIX} sandbox proxy reported {reported!r} instead of a port "
-            f"(see {log})"
-        )
-    return int(reported)
+        time.sleep(0.05)
+
+
+def _kill_process_group(pid: int) -> None:
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        pass
 
 
 def kill_proxy(proxy: ProxyState | None) -> None:
     if proxy is None:
         return
-    try:
-        os.kill(proxy.pid, signal.SIGKILL)
-    except OSError:
-        pass
+    _kill_process_group(proxy.sockd_pid)
 
 
 def create_proxy_state(spec: SandboxBuildSpec, session_dir: Path) -> ProxyState | None:
     if spec.proxy is None:
         return None
 
-    process = _start_proxy(spec.proxy, session_dir)
+    is_linux = isinstance(spec, SandboxBuildSpecLinux)
+    sockd_port = _pick_free_port()
+    if is_linux:
+        sockd_host = PASTA_GATEWAY_IP
+        privoxy_port = PRIVOXY_LINUX_PORT
+    else:
+        sockd_host = PROXY_LISTEN_HOST
+        privoxy_port = _pick_free_port()
+
+    external = _get_external_interface(is_linux)
+    conf = _write_sockd_conf(spec.proxy, session_dir, sockd_port, external)
+    _write_privoxy_conf(session_dir, privoxy_port, sockd_host, sockd_port)
+
+    process = _start_sockd(spec.proxy, session_dir, conf)
     try:
-        port = _read_proxy_port(process, session_dir)
+        _wait_for_sockd(process, sockd_port, session_dir)
     except BaseException:
-        if process.poll() is None:
-            process.kill()
+        _kill_process_group(process.pid)
         raise
-    return ProxyState(port=port, pid=process.pid)
+    return ProxyState(
+        sockd_host=sockd_host,
+        sockd_port=sockd_port,
+        sockd_pid=process.pid,
+        privoxy_port=privoxy_port,
+    )

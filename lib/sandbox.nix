@@ -12,18 +12,16 @@
   roDirs ? [ ],
   roFiles ? [ ],
   env ? { },
-  allowedDomains ? null,
-  allowedHostPorts ? [ ],
+  allowedEndpoints ? [ "*" ],
   publishedPorts ? [ ],
-  # Internal, for the test harness: maps "host" to "addr:port" so the proxy
-  # dials a local address instead of resolving the original.
-  _proxyRedirects ? { },
   # Legacy args: accepted so assertNoLegacyArgs can name them in its error.
   restrictNetwork ? null,
   extraEnv ? null,
   stateDirs ? null,
   stateFiles ? null,
   allowedLocalPorts ? null,
+  allowedDomains ? null,
+  allowedHostPorts ? null,
 }:
 let
   platform = if pkgs.stdenv.isDarwin then "darwin" else "linux";
@@ -34,6 +32,10 @@ let
 
   pkgConfigPathStr = shared.mkPkgConfigPathStr (allowedPackages ++ implicitPackages);
 
+  validatedAllowedEndpoints = shared.validateAllowedEndpoints allowedEndpoints;
+
+  openNetwork = shared.isOpenNetwork validatedAllowedEndpoints;
+
   closurePathsFile = pkgs.writeClosure (
     allowedPackages
     ++ implicitPackages
@@ -43,9 +45,10 @@ let
     # not in implicitPackages so it does not leak into PATH.
     ++ (if platform == "linux" then [ pkgs.coreutils ] else [ ])
     ++ [ shared.preEntryScript ]
+    # Privoxy runs inside the sandbox in restricted mode; the closure, not
+    # PATH, so the agent does not see it as a tool.
+    ++ (if openNetwork then [ ] else [ pkgs.privoxy ])
   );
-
-  validatedAllowedHostPorts = shared.validateAllowedHostPorts allowedHostPorts;
 
   validatedPublishedPorts = shared.validatePublishedPorts publishedPorts;
 
@@ -53,8 +56,6 @@ let
     allowNix = allowNix;
     allowUnixSockets = allowUnixSockets;
   };
-
-  validatedProxyRedirects = shared.validateProxyRedirects _proxyRedirects;
 
   sandboxBuildSpec = import ./spec.nix
     {
@@ -74,13 +75,11 @@ let
       roDirs = roDirs;
       roFiles = roFiles;
       env = env;
-      allowedHostPorts = validatedAllowedHostPorts;
+      allowedEndpoints = validatedAllowedEndpoints;
       publishedPorts = validatedPublishedPorts;
       allowUnixSockets = validatedAllowUnixSockets;
       closurePathsFile = closurePathsFile;
       preEntryScript = shared.preEntryScript;
-      allowedDomains = allowedDomains;
-      _proxyRedirects = validatedProxyRedirects;
     };
 
   envFragment = shared.mkEnvFragment {
@@ -104,9 +103,10 @@ shared.mkWrapper {
     stateDirs = stateDirs;
     stateFiles = stateFiles;
     allowedLocalPorts = allowedLocalPorts;
+    allowedDomains = allowedDomains;
+    allowedHostPorts = allowedHostPorts;
   };
-  allowedHostPorts = validatedAllowedHostPorts;
+  allowedEndpoints = validatedAllowedEndpoints;
   publishedPorts = validatedPublishedPorts;
   allowUnixSockets = validatedAllowUnixSockets;
-  proxyRedirects = validatedProxyRedirects;
 }

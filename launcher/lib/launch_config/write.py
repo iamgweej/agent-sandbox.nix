@@ -8,7 +8,6 @@ from launcher.lib.constants import (
     ARGV_AFTER_ENV,
     ARGV_BEFORE_ENV,
     BWRAP_ARGS,
-    CA_BUNDLE,
     CLEANUP,
     CLEANUP_IF_EMPTY,
     NETWORK,
@@ -42,12 +41,6 @@ def _write_nul_separated(path: Path, values: Sequence[str]) -> None:
 
 def _write_newline_separated(path: Path, lines: Sequence[str]) -> None:
     path.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
-
-
-def _write_concatenated(path: Path, sources: Sequence[Path]) -> None:
-    # Bytes, not text: these are certificates, and re-encoding could alter
-    # them.
-    path.write_bytes(b"".join(source.read_bytes() for source in sources))
 
 
 def _group_by_option(args: Sequence[str]) -> list[str]:
@@ -108,13 +101,10 @@ def _write_common(config: SandboxLaunchConfig, session: SessionState) -> None:
         session_dir / CLEANUP_IF_EMPTY, [str(path) for path in config.cleanup_if_empty]
     )
 
-    # One of the sources is written by the proxy, into this same directory,
-    # so this cannot run before the proxy has reported its port.
-    if config.ca_bundle:
-        _write_concatenated(session_dir / CA_BUNDLE, config.ca_bundle)
-
     if session.proxy is not None:
-        (session_dir / PROXY_PID).write_text(f"{session.proxy.pid}\n", encoding="utf-8")
+        (session_dir / PROXY_PID).write_text(
+            f"{session.proxy.sockd_pid}\n", encoding="utf-8"
+        )
 
 
 def write_launch_config_linux(

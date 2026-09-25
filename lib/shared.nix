@@ -1,7 +1,6 @@
 { pkgs }:
 let
   errorPrefix = "[ERROR][agent-sandbox.nix]";
-  sandboxProxy = import ../proxy { pkgs = pkgs; };
   # Forces --norc --noprofile however bash is reached (SHELL, /bin/sh,
   # direct exec), so the sandboxed process cannot source /etc/bashrc or
   # /etc/profile.
@@ -18,39 +17,188 @@ let
           --add-flags "--noprofile"
         ln -s bash $out/bin/sh
       '';
-  # The proxy's JSON config: { "domain": "*" | ["GET","HEAD"], ... }. A
-  # plain list means every domain gets "*".
-  mkAllowlistFile =
-    allowedDomains:
-    let
-      attrset =
-        if builtins.isList allowedDomains then
-          builtins.listToAttrs (
-            map (d: {
-              name = d;
-              value = "*";
-            }) allowedDomains
-          )
-        else
-          allowedDomains;
-    in
-    pkgs.writeText "sandbox-allowlist.json" (builtins.toJSON attrset);
-  # Shared by the host-port and published-port validators.
+  # Shared by the endpoint and published-port validators.
   validPort = port: builtins.isInt port && port >= 1 && port <= 65535;
-  validateAllowedHostPorts =
-    allowedHostPorts:
-    if allowedHostPorts == null then
-      null
-    else if !(builtins.isList allowedHostPorts) then
-      builtins.throw "${errorPrefix} allowedHostPorts must be null or a list of integers from 1 to 65535"
+
+  # Parses allowedEndpoints into
+  #   { kind = "open" | "domain" | "local"; host; portFrom; portTo; }
+  # "*" is open mode; "localhost:<ports>" is a host-local port or range,
+  # reached directly rather than through sockd; anything else is a domain
+  # (and its subdomains) that sockd matches by name. A domain with no port
+  # expands to two entries, 80 and 443. portFrom and portTo are null only
+  # for "localhost:*".
+  validateAllowedEndpoints =
+    allowedEndpoints:
+    let
+      hint = "Entries are \"*\", \"<domain>[:<port>[-<port>]]\" or \"localhost:<port>[-<port>]\" / \"localhost:*\"";
+      fail =
+        entry: reason:
+        builtins.throw "${errorPrefix} allowedEndpoints: invalid entry ${builtins.toJSON entry}: ${reason}. ${hint}.";
+      # Lowercase ASCII labels only: an uppercase name would still match in
+      # sockd, but a non-ASCII one would need IDNA, which nothing here does.
+      label = "[a-z0-9]([a-z0-9-]*[a-z0-9])?";
+      isDomain = host: builtins.match "${label}(\\.${label})*" host != null;
+      # A numeric last label is an IPv4 literal (or its shorthand); no TLD is
+      # all digits, and sockd must only ever see names.
+      isIpLike = host: builtins.match "(.*\\.)?[0-9]+" host != null;
+      parsePort =
+        entry: text:
+        if builtins.match "[1-9][0-9]{0,4}" text == null then
+          fail entry "bad port ${builtins.toJSON text}"
+        else
+          let
+            port = builtins.fromJSON text;
+          in
+          if validPort port then port else fail entry "port ${text} is outside 1-65535";
+      parsePorts =
+        entry: text:
+        let
+          range = builtins.match "([^-]*)-([^-]*)" text;
+        in
+        if range == null then
+          let
+            port = parsePort entry text;
+          in
+          {
+            portFrom = port;
+            portTo = port;
+          }
+        else
+          let
+            portFrom = parsePort entry (builtins.elemAt range 0);
+            portTo = parsePort entry (builtins.elemAt range 1);
+          in
+          if portFrom > portTo then
+            fail entry "reversed port range"
+          else
+            {
+              portFrom = portFrom;
+              portTo = portTo;
+            };
+      parse =
+        entry:
+        if !(builtins.isString entry) then
+          fail entry "not a string"
+        else if entry == "*" then
+          [
+            {
+              kind = "open";
+              host = null;
+              portFrom = null;
+              portTo = null;
+            }
+          ]
+        else
+          let
+            parts = builtins.match "([^:]*)(:(.*))?" entry;
+            host = pkgs.lib.toLower (builtins.elemAt parts 0);
+            portText = builtins.elemAt parts 2;
+          in
+          if host == "localhost" then
+            if portText == null then
+              fail entry "a localhost entry needs a port, a range, or *"
+            else if portText == "*" then
+              [
+                {
+                  kind = "local";
+                  host = host;
+                  portFrom = null;
+                  portTo = null;
+                }
+              ]
+            else
+              [
+                (
+                  {
+                    kind = "local";
+                    host = host;
+                  }
+                  // parsePorts entry portText
+                )
+              ]
+          else if !(isDomain host) then
+            fail entry "not an ASCII domain name (IP literals and CIDRs are not accepted)"
+          else if isIpLike host then
+            fail entry "IP literals are not accepted, only domain names"
+          else if portText == null then
+            map
+              (port: {
+                kind = "domain";
+                host = host;
+                portFrom = port;
+                portTo = port;
+              })
+              [
+                80
+                443
+              ]
+          else
+            [
+              (
+                {
+                  kind = "domain";
+                  host = host;
+                }
+                // parsePorts entry portText
+              )
+            ];
+    in
+    if !(builtins.isList allowedEndpoints) then
+      builtins.throw "${errorPrefix} allowedEndpoints must be a list of strings. ${hint}"
     else
-      let
-        invalidPorts = builtins.filter (port: !validPort port) allowedHostPorts;
-      in
-      if invalidPorts != [ ] then
-        builtins.throw "${errorPrefix} allowedHostPorts must only contain integers from 1 to 65535 (null allows all). Invalid: ${builtins.toJSON invalidPorts}"
-      else
-        pkgs.lib.unique allowedHostPorts;
+      pkgs.lib.unique (builtins.concatMap parse allowedEndpoints);
+
+  isOpenNetwork = endpoints: builtins.any (e: e.kind == "open") endpoints;
+
+  # null means every host-local TCP port; [ ] means none.
+  mkLocalPorts =
+    endpoints:
+    let
+      local = builtins.filter (e: e.kind == "local") endpoints;
+    in
+    if builtins.any (e: e.portFrom == null) local then
+      null
+    else
+      map (e: {
+        from = e.portFrom;
+        to = e.portTo;
+      }) local;
+
+  # The sockd rule body for the domain entries. The launcher prepends the
+  # runtime header (listen port, external interface, logging, client rule).
+  # One field per line: command: and log: take lists that run to the end of
+  # the line. `from: 0/0` because sockd listens on 127.0.0.1 only, so every
+  # client is already local. The leading dot matches the domain itself and
+  # every subdomain. command: connect refuses BIND, which would let the agent
+  # accept inbound connections on the host, and UDP ASSOCIATE.
+  mkDanteRules =
+    endpoints:
+    let
+      domains = builtins.filter (e: e.kind == "domain") endpoints;
+      portSpec =
+        e:
+        if e.portFrom == e.portTo then
+          "port = ${toString e.portFrom}"
+        else
+          "port ${toString e.portFrom} - ${toString e.portTo}";
+      rule = e: ''
+        socks pass {
+          from: 0/0 to: .${e.host} ${portSpec e}
+          command: connect
+          log: connect error
+        }
+      '';
+    in
+    pkgs.writeText "sandbox-dante-rules.conf" (
+      pkgs.lib.concatMapStrings rule domains
+      + ''
+        socks block {
+          from: 0/0 to: 0/0
+          log: connect error
+        }
+      ''
+    );
+
   # Deliberately no null form: "every port, reachable from the host" is
   # never the intended published surface, unlike allowedHostPorts' null.
   validatePublishedPorts =
@@ -103,23 +251,6 @@ let
     else
       allowUnixSockets;
 
-  # The launcher joins these into SANDBOX_PROXY_REDIRECT as "host=addr[,...]"
-  # and the proxy splits them back apart, so a "," in either half, or an "="
-  # in the host, would forge an entry no caller wrote.
-  validateProxyRedirects =
-    proxyRedirects:
-    if !(builtins.isAttrs proxyRedirects) then
-      builtins.throw "${errorPrefix} _proxyRedirects must be an attrset mapping \"host\" to \"addr:port\""
-    else
-      let
-        validHost = host: builtins.match "[^,=]+" host != null;
-        validAddr = addr: builtins.isString addr && builtins.match "[^,]+" addr != null;
-        invalid = pkgs.lib.filterAttrs (host: addr: !(validHost host) || !(validAddr addr)) proxyRedirects;
-      in
-      if invalid != { } then
-        builtins.throw "${errorPrefix} _proxyRedirects hosts must not contain \",\" or \"=\", and addresses must not contain \",\". Invalid: ${builtins.toJSON invalid}"
-      else
-        proxyRedirects;
   assertNoLegacyArgs =
     {
       restrictNetwork,
@@ -127,17 +258,29 @@ let
       stateDirs,
       stateFiles,
       allowedLocalPorts,
+      allowedDomains,
+      allowedHostPorts,
     }:
     let
       legacyArgHints = {
         allowedLocalPorts =
           if allowedLocalPorts != null then
-            "- The 'allowedLocalPorts' argument is deprecated. Use 'allowedHostPorts' instead."
+            "- The 'allowedLocalPorts' argument is deprecated. Use 'allowedEndpoints' instead, e.g. [ \"localhost:5432\" ]."
           else
             null;
         restrictNetwork =
           if restrictNetwork != null then
-            "- The 'restrictNetwork' argument is deprecated. Network access is controlled by 'allowedDomains': omit it for open internet, set a list/attrset to filter, or [] to block all."
+            "- The 'restrictNetwork' argument is deprecated. Network access is controlled by 'allowedEndpoints': omit it for open internet, list domains to filter, or [] to block all."
+          else
+            null;
+        allowedDomains =
+          if allowedDomains != null then
+            "- The 'allowedDomains' argument is replaced by 'allowedEndpoints': a list of domains (subdomains included, ports 80 and 443), e.g. [ \"anthropic.com\" \"github.com:22\" ]. HTTP method filtering is gone; null becomes [ \"*\" ]."
+          else
+            null;
+        allowedHostPorts =
+          if allowedHostPorts != null then
+            "- The 'allowedHostPorts' argument is replaced by 'allowedEndpoints': write each port as \"localhost:<port>\" or \"localhost:<from>-<to>\"; null becomes \"localhost:*\"."
           else
             null;
         extraEnv =
@@ -164,12 +307,20 @@ let
       || stateDirs != null
       || stateFiles != null
       || allowedLocalPorts != null
+      || allowedDomains != null
+      || allowedHostPorts != null
     then
       builtins.throw throwMsg
     else
       null;
 
-  preEntryScript = pkgs.writeShellScript "pre-entry-script" (builtins.readFile ./pre-entry-script.sh);
+  # sleep by store path: bash has no builtin one, and the sandbox PATH need
+  # not include coreutils.
+  preEntryScript = pkgs.writeShellScript "pre-entry-script" (
+    builtins.replaceStrings [ "@sleep@" ] [ "${pkgs.coreutils}/bin/sleep" ] (
+      builtins.readFile ./pre-entry-script.sh
+    )
+  );
 
   # __pycache__ would otherwise change the store hash from one build to the
   # next depending on whether anything had imported the package in place.
@@ -233,24 +384,21 @@ let
       stub,
       buildSpec,
       legacyArgs,
-      allowedHostPorts,
+      allowedEndpoints,
       publishedPorts,
       allowUnixSockets,
-      proxyRedirects,
     }:
     builtins.seq (assertNoLegacyArgs legacyArgs) (
-      builtins.seq allowedHostPorts (
+      builtins.deepSeq allowedEndpoints (
         builtins.seq publishedPorts (
           builtins.seq allowUnixSockets (
-            builtins.seq proxyRedirects (
-              pkgs.runCommand outName { } ''
-                mkdir -p $out/bin
-                install -m755 ${stub} $out/bin/${outName}
-              ''
-              // {
-                buildSpec = buildSpec;
-              }
-            )
+            pkgs.runCommand outName { } ''
+              mkdir -p $out/bin
+              install -m755 ${stub} $out/bin/${outName}
+            ''
+            // {
+              buildSpec = buildSpec;
+            }
           )
         )
       )
@@ -258,13 +406,13 @@ let
 in
 {
   bashWrapper = bashWrapper;
-  mkAllowlistFile = mkAllowlistFile;
-  sandboxProxy = sandboxProxy;
   assertNoLegacyArgs = assertNoLegacyArgs;
-  validateAllowedHostPorts = validateAllowedHostPorts;
+  validateAllowedEndpoints = validateAllowedEndpoints;
+  isOpenNetwork = isOpenNetwork;
+  mkLocalPorts = mkLocalPorts;
+  mkDanteRules = mkDanteRules;
   validatePublishedPorts = validatePublishedPorts;
   validateAllowUnixSockets = validateAllowUnixSockets;
-  validateProxyRedirects = validateProxyRedirects;
   preEntryScript = preEntryScript;
   launcherPackage = launcherPackage;
   mkImplicitPackages = mkImplicitPackages;

@@ -8,10 +8,9 @@ from typing import Sequence
 
 from launcher.lib.build_spec import SandboxBuildSpecDarwin
 from launcher.lib.constants import (
-    CA_BUNDLE,
-    CA_CERT,
-    NO_PROXY_HOSTS,
     PASSWD,
+    PRIVOXY_CONF,
+    PRIVOXY_PID,
     SEATBELT_PROFILE,
 )
 from launcher.lib.git_state import (
@@ -27,6 +26,7 @@ from launcher.lib.launch_config.darwin import seatbelt
 from launcher.lib.launch_config.shared import (
     NIX_STORE,
     SandboxLaunchConfig,
+    get_proxy_env,
     get_sessions_root_warnings,
     get_store_symlink_targets,
 )
@@ -208,6 +208,8 @@ def _get_computed_env(
         f"PATH={spec.sandbox_path}",
         f"PKG_CONFIG_PATH={spec.pkg_config_path}",
         f"SSL_CERT_DIR={spec.cacert_dir}",
+        f"SSL_CERT_FILE={spec.cacert_bundle}",
+        f"NIX_SSL_CERT_FILE={spec.cacert_bundle}",
         f"TMPDIR={session.sandbox_tmpdir}",
         f"CLAUDE_CODE_TMPDIR={session.sandbox_tmpdir}",
         "GIT_CONFIG_COUNT=1",
@@ -217,35 +219,19 @@ def _get_computed_env(
     if host.term is not None:
         pairs.insert(1, f"TERM={host.term}")
 
-    if session.proxy is None:
-        pairs += [
-            f"SSL_CERT_FILE={spec.cacert_bundle}",
-            f"NIX_SSL_CERT_FILE={spec.cacert_bundle}",
-        ]
+    if session.proxy is None or spec.proxy is None:
         return pairs
 
-    bundle = session.session_dir / CA_BUNDLE
-    cert = session.session_dir / CA_CERT
-    proxy_url = f"http://127.0.0.1:{session.proxy.port}"
-    pairs += [
-        f"SSL_CERT_FILE={bundle}",
-        f"NIX_SSL_CERT_FILE={bundle}",
-        f"NODE_EXTRA_CA_CERTS={cert}",
-        f"REQUESTS_CA_BUNDLE={bundle}",
-        f"HTTP_PROXY={proxy_url}",
-        f"HTTPS_PROXY={proxy_url}",
-        f"http_proxy={proxy_url}",
-        f"https_proxy={proxy_url}",
-    ]
-    # Only when a port is actually open: with none, a loopback request is
-    # better refused by the proxy, which says so in proxy.log, than dropped
-    # by the seatbelt, which says nothing.
-    if spec.allowed_host_ports is None or spec.allowed_host_ports:
-        pairs += [
-            f"NO_PROXY={NO_PROXY_HOSTS}",
-            f"no_proxy={NO_PROXY_HOSTS}",
-        ]
-    return pairs
+    # The pid file goes in the sandbox TMPDIR because the sandbox can write
+    # nothing else in the session directory; cleanup checks the pid before
+    # trusting it.
+    return pairs + get_proxy_env(
+        session,
+        forwarder=spec.proxy.privoxy,
+        forwarder_conf=session.session_dir / PRIVOXY_CONF,
+        forwarder_pidfile=session.sandbox_tmpdir / PRIVOXY_PID,
+        local_ports_open=spec.local_ports is None or bool(spec.local_ports),
+    )
 
 
 def _get_profile_lines(
@@ -267,10 +253,13 @@ def _get_profile_lines(
     lines += seatbelt.MACH_IPC
 
     if session.proxy is None:
-        lines += seatbelt.network_open(spec.allowed_host_ports)
+        lines += seatbelt.network_open(spec.local_ports)
     else:
         lines += seatbelt.network_restricted(
-            session.proxy.port, spec.allowed_host_ports, spec.published_ports
+            session.proxy.sockd_port,
+            session.proxy.privoxy_port,
+            spec.local_ports,
+            spec.published_ports,
         )
 
     # After the network rules, so the allows outrank open mode's blanket
@@ -291,12 +280,8 @@ def _get_profile_lines(
 
     lines += seatbelt.device_nodes(host.tty)
     lines += seatbelt.SYSTEM_LIBRARIES
-    if session.proxy is None:
-        ca_bundle, ca_cert = None, None
-    else:
-        ca_bundle = session.session_dir / CA_BUNDLE
-        ca_cert = session.session_dir / CA_CERT
-    lines += seatbelt.dns_tls(session.session_dir / PASSWD, ca_bundle, ca_cert)
+    privoxy_conf = None if session.proxy is None else session.session_dir / PRIVOXY_CONF
+    lines += seatbelt.dns_tls(session.session_dir / PASSWD, privoxy_conf)
     lines += seatbelt.KEYCHAINS
     lines += seatbelt.temp_dirs(session.sandbox_tmpdir)
     lines += seatbelt.NIX_STORE_METADATA
@@ -349,17 +334,10 @@ def compute_launch_config(
         str(spec.sandboxed_binary),
     ]
 
-    ca_bundle = (
-        ()
-        if session.proxy is None
-        else (spec.cacert_bundle, session.session_dir / CA_CERT)
-    )
-
     return SandboxLaunchConfigDarwin(
         argv_before_env=tuple(argv_before_env),
         argv_after_env=tuple(argv_after_env),
         passwd=_get_passwd(host),
-        ca_bundle=ca_bundle,
         cleanup=(session.sandbox_home, session.sandbox_tmpdir),
         cleanup_if_empty=(),
         warnings=tuple(warnings),
