@@ -12,21 +12,30 @@ from launcher.lib.constants import ERROR_PREFIX
 
 @dataclass(frozen=True, kw_only=True)
 class ProxySpec:
-    binary: Path
-    allowlist_file: Path
-    # Testing only; empty in production builds.
-    redirects: Mapping[str, str]
+    # Runs on the host and is the only policy point.
+    sockd: Path
+    # Runs inside the sandbox, translating HTTP proxy requests for sockd.
+    privoxy: Path
+    # The Nix-generated rule body; the launcher prepends the runtime header.
+    dante_rules_file: Path
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Self:
-        binary = Path(data["binary"])
-        allowlist_file = Path(data["allowlist_file"])
-        redirects = dict(data["redirects"])
         return cls(
-            binary=binary,
-            allowlist_file=allowlist_file,
-            redirects=redirects,
+            sockd=Path(data["sockd"]),
+            privoxy=Path(data["privoxy"]),
+            dante_rules_file=Path(data["dante_rules_file"]),
         )
+
+
+@dataclass(frozen=True, kw_only=True)
+class PortRange:
+    first: int
+    last: int
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> Self:
+        return cls(first=int(data["from"]), last=int(data["to"]))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -109,8 +118,10 @@ class SandboxBuildSpec:
     # Keys only. The values are shell expressions the stub resolves; they
     # never enter this process.
     env_keys: tuple[str, ...]
+    # As declared, for launch.log; local_ports and proxy are what is enforced.
+    allowed_endpoints: tuple[str, ...]
     # None means every host-local TCP port; the empty tuple means none.
-    allowed_host_ports: tuple[int, ...] | None
+    local_ports: tuple[PortRange, ...] | None
     published_ports: tuple[PublishedPort, ...]
     closure_paths_file: Path
     cacert_dir: Path
@@ -149,7 +160,8 @@ class _CommonBuildSpec(TypedDict):
     ro_dirs: tuple[str, ...]
     ro_files: tuple[str, ...]
     env_keys: tuple[str, ...]
-    allowed_host_ports: tuple[int, ...] | None
+    allowed_endpoints: tuple[str, ...]
+    local_ports: tuple[PortRange, ...] | None
     published_ports: tuple[PublishedPort, ...]
     closure_paths_file: Path
     cacert_dir: Path
@@ -161,11 +173,11 @@ class _CommonBuildSpec(TypedDict):
 
 
 def _common_build_spec(data: Mapping[str, Any]) -> _CommonBuildSpec:
-    ports = data["allowed_host_ports"]
+    ports = data["local_ports"]
     if ports is None:
-        allowed_host_ports = None
+        local_ports = None
     else:
-        allowed_host_ports = tuple(ports)
+        local_ports = tuple(PortRange.from_dict(entry) for entry in ports)
 
     published_ports = tuple(
         PublishedPort.from_dict(entry) for entry in data["published_ports"]
@@ -189,7 +201,8 @@ def _common_build_spec(data: Mapping[str, Any]) -> _CommonBuildSpec:
         ro_dirs=tuple(data["ro_dirs"]),
         ro_files=tuple(data["ro_files"]),
         env_keys=tuple(data["env_keys"]),
-        allowed_host_ports=allowed_host_ports,
+        allowed_endpoints=tuple(data["allowed_endpoints"]),
+        local_ports=local_ports,
         published_ports=published_ports,
         closure_paths_file=Path(data["closure_paths_file"]),
         cacert_dir=Path(data["cacert_dir"]),

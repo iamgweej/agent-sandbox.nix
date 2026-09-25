@@ -54,13 +54,6 @@ def write_launch_request(
     now: datetime,
 ) -> None:
     """Written before the host is read, so it survives everything after it."""
-    if spec.allowed_host_ports is None:
-        host_ports = "all host-local TCP ports"
-    elif spec.allowed_host_ports:
-        host_ports = ", ".join(str(port) for port in spec.allowed_host_ports)
-    else:
-        host_ports = _NONE
-
     if spec.published_ports:
         published_ports = ", ".join(
             f"{forward.bind_addr}/{forward.port}" for forward in spec.published_ports
@@ -71,7 +64,7 @@ def write_launch_request(
     if spec.proxy is None:
         network = "unrestricted"
     else:
-        network = f"restricted (allowlist {spec.proxy.allowlist_file})"
+        network = f"restricted (sockd rules {spec.proxy.dante_rules_file})"
 
     _append(
         log_file,
@@ -85,7 +78,7 @@ def write_launch_request(
             _field("network", network),
             _field("allowNix", str(spec.allow_nix).lower()),
             _field("allowUnixSockets", str(spec.allow_unix_sockets).lower()),
-            _field("allowedHostPorts", host_ports),
+            _list_field("allowedEndpoints", spec.allowed_endpoints),
             _field("publishedPorts", published_ports),
             # Keys only. The values must never land here: keeping them out is
             # what makes a session directory safe to attach to an issue.
@@ -148,7 +141,12 @@ def write_launch_outcome(
         lines.append(_field("proxy", _NONE))
     else:
         lines.append(
-            _field("proxy", f"port {session.proxy.port} (pid {session.proxy.pid})")
+            _field(
+                "proxy",
+                f"sockd {session.proxy.sockd_host}:{session.proxy.sockd_port} "
+                f"(pid {session.proxy.sockd_pid}), "
+                f"privoxy 127.0.0.1:{session.proxy.privoxy_port}",
+            )
         )
 
     if isinstance(session, SessionStateDarwin):

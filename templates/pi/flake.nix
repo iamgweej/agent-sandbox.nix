@@ -39,24 +39,16 @@
             };
             # pi defaults to the google provider. Keep the domains of the
             # providers you use, and drop the rest.
-            allowedDomains = {
-              "generativelanguage.googleapis.com" = "*";
-              "anthropic.com" = "*";
-              "api.openai.com" = "*";
+            # Each domain includes its subdomains, on ports 80 and 443.
+            allowedEndpoints = [
+              "generativelanguage.googleapis.com"
+              "anthropic.com"
+              "api.openai.com"
               # `pi install` fetches extensions from npm.
-              "registry.npmjs.org" = [
-                "GET"
-                "HEAD"
-              ];
-              "raw.githubusercontent.com" = [
-                "GET"
-                "HEAD"
-              ];
-              "api.github.com" = [
-                "GET"
-                "HEAD"
-              ];
-            };
+              "registry.npmjs.org"
+              "raw.githubusercontent.com"
+              "api.github.com"
+            ];
           };
         in
         {

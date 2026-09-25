@@ -4,7 +4,7 @@ owns the order, which is load-bearing: seatbelt is last-match-wins."""
 from pathlib import Path
 from typing import Sequence
 
-from launcher.lib.build_spec import PublishedPort
+from launcher.lib.build_spec import PortRange, PublishedPort
 from launcher.lib.host_state import DeclaredDir, DeclaredPath
 
 HEADER = (
@@ -152,10 +152,11 @@ def device_nodes(tty: Path | None) -> list[str]:
     return lines
 
 
-def dns_tls(passwd: Path, ca_bundle: Path | None, ca_cert: Path | None) -> list[str]:
+def dns_tls(passwd: Path, privoxy_conf: Path | None) -> list[str]:
     # Session directory files are granted by name, never by subpath: the
     # directory also holds proxy.pid, and a readable pid file reconstructs
     # the process enumeration the kern.proc.* denies exist to prevent.
+    # privoxy.conf is read by Privoxy, which runs in here with the agent.
     lines = [
         "",
         ";; DNS, TLS & name resolution",
@@ -168,12 +169,8 @@ def dns_tls(passwd: Path, ca_bundle: Path | None, ca_cert: Path | None) -> list[
         '  (subpath "/private/etc/static")',
         '  (literal "/private/etc/hosts"))',
     ]
-    if ca_bundle is not None and ca_cert is not None:
-        lines += [
-            "(allow file-read*",
-            f'  (literal "{ca_bundle}")',
-            f'  (literal "{ca_cert}"))',
-        ]
+    if privoxy_conf is not None:
+        lines.append(f'(allow file-read* (literal "{privoxy_conf}"))')
     return lines
 
 
@@ -375,14 +372,22 @@ def unix_sockets(
     return lines
 
 
-def _host_port_rules(allowed_host_ports: Sequence[int] | None) -> list[str]:
-    # TCP-only; None means every host-local TCP port.
-    if allowed_host_ports is None:
+def _host_port_rules(local_ports: Sequence[PortRange] | None) -> list[str]:
+    # TCP-only; None means every host-local TCP port. Seatbelt's ip filter
+    # takes a single port or *, so a range is enumerated, one rule per port.
+    if local_ports is None or any(
+        ports.first == 1 and ports.last == 65535 for ports in local_ports
+    ):
         return ['(allow network-outbound (remote ip "localhost:*"))']
-    return [
-        f'(allow network-outbound (remote ip "localhost:{port}"))'
-        for port in allowed_host_ports
-    ]
+    seen: set[int] = set()
+    rules: list[str] = []
+    for ports in local_ports:
+        for port in range(ports.first, ports.last + 1):
+            if port in seen:
+                continue
+            seen.add(port)
+            rules.append(f'(allow network-outbound (remote ip "localhost:{port}"))')
+    return rules
 
 
 def _published_port_rules(published_ports: Sequence[PublishedPort]) -> list[str]:
@@ -402,28 +407,33 @@ def _published_port_rules(published_ports: Sequence[PublishedPort]) -> list[str]
 
 
 def network_restricted(
-    proxy_port: int,
-    allowed_host_ports: Sequence[int] | None,
+    sockd_port: int,
+    privoxy_port: int,
+    local_ports: Sequence[PortRange] | None,
     published_ports: Sequence[PublishedPort],
 ) -> list[str]:
-    # Pinned to the proxy port so other loopback services cannot be reached
-    # directly, bypassing the proxy's filtering. UNIX-socket egress is
-    # deliberately absent: it would reach any host socket the UID can
-    # (terminal IPC, ssh-agent), and the proxy speaks TCP.
+    # Pinned to the two proxy ports so other loopback services cannot be
+    # reached directly, bypassing sockd's filtering. Privoxy runs in here, so
+    # it needs to accept on its own port; it can reach nothing but sockd.
+    # UNIX-socket egress is deliberately absent: it would reach any host
+    # socket the UID can (terminal IPC, ssh-agent), and both proxies speak
+    # TCP.
     return (
         [
             "",
-            ";; Network — localhost only, pinned to the proxy port",
+            ";; Network — localhost only, pinned to sockd and Privoxy",
             '(allow network-bind (local ip "localhost:*"))',
             "(allow system-socket)",
-            f'(allow network-outbound (remote ip "localhost:{proxy_port}"))',
+            f'(allow network-outbound (remote ip "localhost:{sockd_port}"))',
+            f'(allow network-outbound (remote ip "localhost:{privoxy_port}"))',
+            f'(allow network-inbound (local ip "localhost:{privoxy_port}"))',
         ]
-        + _host_port_rules(allowed_host_ports)
+        + _host_port_rules(local_ports)
         + _published_port_rules(published_ports)
     )
 
 
-def network_open(allowed_host_ports: Sequence[int] | None) -> list[str]:
+def network_open(local_ports: Sequence[PortRange] | None) -> list[str]:
     # system-socket gates socket(PF_SYSTEM, ...), meaning kernel-control
     # sockets and utun, not AF_UNIX. No _published_port_rules here: the blanket
     # (allow network*) already covers bind and inbound in open mode.
@@ -437,4 +447,4 @@ def network_open(allowed_host_ports: Sequence[int] | None) -> list[str]:
         ";; Required for DNS: getaddrinfo() resolves over this socket.",
         "(allow network-outbound",
         '  (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))',
-    ] + _host_port_rules(allowed_host_ports)
+    ] + _host_port_rules(local_ports)

@@ -2,8 +2,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-from launcher.lib.constants import WARN_PREFIX
+from launcher.lib.constants import NO_PROXY_HOSTS, WARN_PREFIX
 from launcher.lib.host_state import DeclaredDir, DeclaredPath, HostState
+from launcher.lib.session_state import SessionState
 
 NIX_STORE = Path("/nix/store")
 
@@ -15,7 +16,6 @@ class SandboxLaunchConfig:
     argv_before_env: tuple[str, ...]
     argv_after_env: tuple[str, ...]
     passwd: str
-    ca_bundle: tuple[Path, ...]
     cleanup: tuple[Path, ...]
     # Removed only if still empty: content something wrote there in the
     # meantime is not ours to delete.
@@ -67,6 +67,46 @@ def get_store_symlink_targets(
             targets.append(landing)
 
     return tuple(targets), warnings
+
+
+def get_proxy_env(
+    session: SessionState,
+    *,
+    forwarder: Path,
+    forwarder_conf: Path,
+    forwarder_pidfile: Path,
+    local_ports_open: bool,
+) -> list[str]:
+    """The restricted-mode environment. HTTP clients get Privoxy on the
+    sandbox loopback, as a plain HTTP proxy; SOCKS-capable ones get sockd
+    directly. socks5h, not socks5: the name has to reach sockd, which matches
+    names and refuses addresses. The SANDBOX_HTTP_FORWARDER* variables are
+    the pre-entry script's, which unsets them before starting the agent."""
+    if session.proxy is None:
+        return []
+    http_proxy = f"http://127.0.0.1:{session.proxy.privoxy_port}"
+    all_proxy = f"socks5h://{session.proxy.sockd_host}:{session.proxy.sockd_port}"
+    pairs = [
+        f"HTTP_PROXY={http_proxy}",
+        f"HTTPS_PROXY={http_proxy}",
+        f"http_proxy={http_proxy}",
+        f"https_proxy={http_proxy}",
+        f"ALL_PROXY={all_proxy}",
+        f"all_proxy={all_proxy}",
+        f"SANDBOX_HTTP_FORWARDER={forwarder}",
+        f"SANDBOX_HTTP_FORWARDER_CONF={forwarder_conf}",
+        f"SANDBOX_HTTP_FORWARDER_PORT={session.proxy.privoxy_port}",
+        f"SANDBOX_HTTP_FORWARDER_PIDFILE={forwarder_pidfile}",
+    ]
+    # Only when a local port is actually open: with none, a loopback request
+    # is better refused by sockd, which says so in proxy.log, than dropped by
+    # the firewall or seatbelt, which says nothing.
+    if local_ports_open:
+        pairs += [
+            f"NO_PROXY={NO_PROXY_HOSTS}",
+            f"no_proxy={NO_PROXY_HOSTS}",
+        ]
+    return pairs
 
 
 def get_sessions_root_warnings(host: HostState, session_dir: Path) -> list[str]:

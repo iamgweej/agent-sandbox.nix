@@ -8,11 +8,11 @@ from typing import Mapping, Sequence
 
 from launcher.lib.build_spec import PublishedPort, SandboxBuildSpecLinux
 from launcher.lib.constants import (
-    CA_BUNDLE,
-    CA_CERT,
     NETWORK,
-    NO_PROXY_HOSTS,
+    PASTA_GATEWAY_IP,
     PASSWD,
+    PRIVOXY_CONF,
+    PRIVOXY_PID,
     SECCOMP_FD,
     SECCOMP_FILTER,
 )
@@ -35,6 +35,7 @@ from launcher.lib.launch_config.linux.seccomp import get_unix_deny_filter
 from launcher.lib.launch_config.shared import (
     NIX_STORE,
     SandboxLaunchConfig,
+    get_proxy_env,
     get_sessions_root_warnings,
     is_already_bound,
 )
@@ -42,16 +43,11 @@ from launcher.lib.session_state import SessionState
 
 NIX_VAR = Path("/nix/var")
 SANDBOX_TMPDIR = Path("/tmp")
-# Fixed paths rather than the session directory's own, so nothing inside the
+# A fixed path rather than the session directory's own, so nothing inside the
 # sandbox learns where that is.
-SANDBOX_CA_BUNDLE = Path("/tmp/sandbox-ca-bundle.pem")
-SANDBOX_CA_CERT = Path("/tmp/sandbox-ca-cert.pem")
+SANDBOX_PRIVOXY_CONF = Path("/tmp/sandbox-privoxy.conf")
 SANDBOX_PASSWD = Path("/etc/passwd")
 
-# pasta forwards <gateway>:<port> to 127.0.0.1:<port> on the host, which is
-# both how the sandbox reaches the proxy and why the gateway has to be
-# firewalled in open mode.
-PASTA_GATEWAY_IP = "10.0.2.2"
 PASTA_NAMESPACE_IP = "10.0.2.1"
 PASTA_NETMASK = "255.255.255.0"
 PASTA_FLAGS_PREFIX = (
@@ -126,6 +122,8 @@ def _get_computed_env(
         f"PATH={spec.sandbox_path}",
         f"PKG_CONFIG_PATH={spec.pkg_config_path}",
         f"SSL_CERT_DIR={spec.cacert_dir}",
+        f"SSL_CERT_FILE={spec.cacert_bundle}",
+        f"NIX_SSL_CERT_FILE={spec.cacert_bundle}",
         f"TMPDIR={SANDBOX_TMPDIR}",
         "GIT_CONFIG_COUNT=1",
         "GIT_CONFIG_KEY_0=user.useConfigOnly",
@@ -136,32 +134,16 @@ def _get_computed_env(
     if host.nix_daemon_socket is not None:
         pairs.append(f"NIX_DAEMON_SOCKET_PATH={host.nix_daemon_socket}")
 
-    if session.proxy is None:
-        return pairs + [
-            f"SSL_CERT_FILE={spec.cacert_bundle}",
-            f"NIX_SSL_CERT_FILE={spec.cacert_bundle}",
-        ]
+    if session.proxy is None or spec.proxy is None:
+        return pairs
 
-    proxy_url = f"http://{PASTA_GATEWAY_IP}:{session.proxy.port}"
-    pairs += [
-        f"SSL_CERT_FILE={SANDBOX_CA_BUNDLE}",
-        f"NIX_SSL_CERT_FILE={SANDBOX_CA_BUNDLE}",
-        f"NODE_EXTRA_CA_CERTS={SANDBOX_CA_CERT}",
-        f"REQUESTS_CA_BUNDLE={SANDBOX_CA_BUNDLE}",
-        f"HTTP_PROXY={proxy_url}",
-        f"HTTPS_PROXY={proxy_url}",
-        f"http_proxy={proxy_url}",
-        f"https_proxy={proxy_url}",
-    ]
-    # Only when a port is actually open: with none, a loopback request is
-    # better refused by the proxy, which says so in proxy.log, than dropped
-    # by the firewall, which says nothing.
-    if spec.allowed_host_ports is None or spec.allowed_host_ports:
-        pairs += [
-            f"NO_PROXY={NO_PROXY_HOSTS}",
-            f"no_proxy={NO_PROXY_HOSTS}",
-        ]
-    return pairs
+    return pairs + get_proxy_env(
+        session,
+        forwarder=spec.proxy.privoxy,
+        forwarder_conf=SANDBOX_PRIVOXY_CONF,
+        forwarder_pidfile=SANDBOX_TMPDIR / PRIVOXY_PID,
+        local_ports_open=spec.local_ports is None or bool(spec.local_ports),
+    )
 
 
 def _get_bwrap_args(
@@ -238,10 +220,8 @@ def _get_bwrap_args(
         args += ["--ro-bind", daemon_socket, daemon_socket]
 
     if session.proxy is not None:
-        bundle = session.session_dir / CA_BUNDLE
-        cert = session.session_dir / CA_CERT
-        args += ["--ro-bind", str(bundle), str(SANDBOX_CA_BUNDLE)]
-        args += ["--ro-bind", str(cert), str(SANDBOX_CA_CERT)]
+        conf = session.session_dir / PRIVOXY_CONF
+        args += ["--ro-bind", str(conf), str(SANDBOX_PRIVOXY_CONF)]
 
     args += ["--symlink", str(spec.shell), "/bin/sh"]
     args += ["--symlink", str(spec.dependencies.env), "/usr/bin/env"]
@@ -267,9 +247,13 @@ def compute_launch_config(
     binds = get_declared_binds(host, prefixes)
     git_args, masked = get_git_binds(spec, git)
 
-    proxy_port = session.proxy.port if session.proxy is not None else None
+    if session.proxy is None:
+        sockd_port, privoxy_port = None, None
+    else:
+        sockd_port = session.proxy.sockd_port
+        privoxy_port = session.proxy.privoxy_port
     sysctls: dict[str, str] = {}
-    if spec.allowed_host_ports is None or spec.allowed_host_ports:
+    if spec.local_ports is None or spec.local_ports:
         # DNAT from the sandbox's loopback needs route_localnet, which no nft
         # ruleset can express.
         sysctls = {path: "1" for path in ROUTE_LOCALNET_SYSCTLS}
@@ -312,17 +296,10 @@ def compute_launch_config(
         + [str(spec.pre_entry_script), str(spec.sandboxed_binary)]
     )
 
-    ca_bundle = (
-        ()
-        if session.proxy is None
-        else (spec.cacert_bundle, session.session_dir / CA_CERT)
-    )
-
     return SandboxLaunchConfigLinux(
         argv_before_env=tuple(argv_before_env),
         argv_after_env=tuple(argv_after_env),
         passwd=f"user:x:{host.uid}:{host.gid}:sandbox user:{host.real_home}:/bin/sh\n",
-        ca_bundle=ca_bundle,
         cleanup=(),
         cleanup_if_empty=tuple(masked),
         warnings=tuple(warnings) + binds.warnings,
@@ -333,9 +310,10 @@ def compute_launch_config(
             rules=tuple(
                 get_nft_rules(
                     PASTA_GATEWAY_IP,
-                    proxy_port,
-                    spec.allowed_host_ports,
+                    sockd_port,
+                    spec.local_ports,
                     [forward.port for forward in spec.published_ports],
+                    privoxy_port,
                 )
             ),
             seccomp_filter=seccomp_filter,

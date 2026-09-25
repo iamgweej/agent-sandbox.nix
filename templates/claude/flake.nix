@@ -40,18 +40,13 @@
               GITHUB_TOKEN = "$GITHUB_TOKEN";
               CLAUDE_CONFIG_DIR = "$HOME/.claude";
             };
-            allowedDomains = {
-              "anthropic.com" = "*";
-              "claude.com" = "*";
-              "raw.githubusercontent.com" = [
-                "GET"
-                "HEAD"
-              ];
-              "api.github.com" = [
-                "GET"
-                "HEAD"
-              ];
-            };
+            # Each domain includes its subdomains, on ports 80 and 443.
+            allowedEndpoints = [
+              "anthropic.com"
+              "claude.com"
+              "raw.githubusercontent.com"
+              "api.github.com"
+            ];
           };
         in
         {

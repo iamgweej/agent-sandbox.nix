@@ -15,12 +15,10 @@
   roDirs,
   roFiles,
   env,
-  allowedHostPorts,
+  allowedEndpoints,
   publishedPorts,
   closurePathsFile,
   preEntryScript,
-  allowedDomains,
-  _proxyRedirects ? { },
 }:
 let
   emptyFile = pkgs.writeText "sandbox-empty" "";
@@ -52,16 +50,16 @@ let
         nix = nixBinary;
       };
 
-  # Omitted when allowedDomains is unset, so an unrestricted wrapper does
-  # not carry the Go proxy in its closure.
+  # Null in open mode, so an unrestricted wrapper carries neither proxy in
+  # its closure. sockd runs on the host; Privoxy runs inside the sandbox.
   proxy =
-    if allowedDomains == null then
+    if shared.isOpenNetwork allowedEndpoints then
       null
     else
       {
-        binary = "${shared.sandboxProxy}/bin/sandbox-proxy";
-        allowlist_file = "${shared.mkAllowlistFile allowedDomains}";
-        redirects = _proxyRedirects;
+        sockd = "${pkgs.dante}/bin/sockd";
+        privoxy = "${pkgs.privoxy}/bin/privoxy";
+        dante_rules_file = "${shared.mkDanteRules allowedEndpoints}";
       };
 
   platformFields =
@@ -93,7 +91,20 @@ let
     # Keys only. The values are runtime shell expressions, emitted as a
     # fragment the stub sources; they never reach Python.
     env_keys = builtins.attrNames env;
-    allowed_host_ports = allowedHostPorts;
+    # For launch.log only; what is enforced is local_ports and the proxy.
+    allowed_endpoints = map (
+      e:
+      if e.kind == "open" then
+        "*"
+      else if e.portFrom == null then
+        "${e.host}:*"
+      else if e.portFrom == e.portTo then
+        "${e.host}:${toString e.portFrom}"
+      else
+        "${e.host}:${toString e.portFrom}-${toString e.portTo}"
+    ) allowedEndpoints;
+    # null means every host-local TCP port; [ ] means none.
+    local_ports = shared.mkLocalPorts allowedEndpoints;
     published_ports = map (entry: {
       port = entry.port;
       bind_addr = entry.bindAddr;
