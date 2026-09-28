@@ -15,6 +15,7 @@
   roDirs,
   roFiles,
   env,
+  workspaceDir,
   allowedEndpoints,
   publishedPorts,
   closurePathsFile,
@@ -91,6 +92,7 @@ let
     # Keys only. The values are runtime shell expressions, emitted as a
     # fragment the stub sources; they never reach Python.
     env_keys = builtins.attrNames env;
+    workspace_dir = workspaceDir;
     # For launch.log only; what is enforced is local_ports and the proxy.
     allowed_endpoints = map (
       e:

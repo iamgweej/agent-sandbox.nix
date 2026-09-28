@@ -13,6 +13,7 @@
   roFiles ? [ ],
   env ? { },
   allowedEndpoints ? [ "*" ],
+  workspaceDir ? "$PWD",
   publishedPorts ? [ ],
   # Legacy args: accepted so assertNoLegacyArgs can name them in its error.
   restrictNetwork ? null,
@@ -57,6 +58,8 @@ let
     allowUnixSockets = allowUnixSockets;
   };
 
+  validatedWorkspaceDir = shared.validateWorkspaceDir workspaceDir;
+
   sandboxBuildSpec = import ./spec.nix
     {
       pkgs = pkgs;
@@ -75,6 +78,7 @@ let
       roDirs = roDirs;
       roFiles = roFiles;
       env = env;
+      workspaceDir = validatedWorkspaceDir;
       allowedEndpoints = validatedAllowedEndpoints;
       publishedPorts = validatedPublishedPorts;
       allowUnixSockets = validatedAllowUnixSockets;
@@ -109,4 +113,5 @@ shared.mkWrapper {
   allowedEndpoints = validatedAllowedEndpoints;
   publishedPorts = validatedPublishedPorts;
   allowUnixSockets = validatedAllowUnixSockets;
+  workspaceDir = validatedWorkspaceDir;
 }

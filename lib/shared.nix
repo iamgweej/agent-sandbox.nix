@@ -199,6 +199,19 @@ let
       ''
     );
 
+  validateWorkspaceDir =
+    workspaceDir:
+    if !(builtins.isString workspaceDir) then
+      builtins.throw "${errorPrefix} workspaceDir must be a string holding an absolute path (\"$VAR\" and \"~\" are expanded at launch)"
+    else
+      let
+        firstChar = builtins.substring 0 1 workspaceDir;
+      in
+      if firstChar != "/" && firstChar != "~" && firstChar != "$" then
+        builtins.throw "${errorPrefix} workspaceDir must be an absolute path, or start with \"$\" or \"~\" to be expanded at launch. Invalid: ${builtins.toJSON workspaceDir}"
+      else
+        workspaceDir;
+
   # Deliberately no null form: "every port, reachable from the host" is
   # never the intended published surface, unlike allowedHostPorts' null.
   validatePublishedPorts =
@@ -387,18 +400,21 @@ let
       allowedEndpoints,
       publishedPorts,
       allowUnixSockets,
+      workspaceDir,
     }:
     builtins.seq (assertNoLegacyArgs legacyArgs) (
       builtins.deepSeq allowedEndpoints (
         builtins.seq publishedPorts (
           builtins.seq allowUnixSockets (
-            pkgs.runCommand outName { } ''
-              mkdir -p $out/bin
-              install -m755 ${stub} $out/bin/${outName}
-            ''
-            // {
-              buildSpec = buildSpec;
-            }
+            builtins.seq workspaceDir (
+              pkgs.runCommand outName { } ''
+                mkdir -p $out/bin
+                install -m755 ${stub} $out/bin/${outName}
+              ''
+              // {
+                buildSpec = buildSpec;
+              }
+            )
           )
         )
       )
@@ -413,6 +429,7 @@ in
   mkDanteRules = mkDanteRules;
   validatePublishedPorts = validatePublishedPorts;
   validateAllowUnixSockets = validateAllowUnixSockets;
+  validateWorkspaceDir = validateWorkspaceDir;
   preEntryScript = preEntryScript;
   launcherPackage = launcherPackage;
   mkImplicitPackages = mkImplicitPackages;

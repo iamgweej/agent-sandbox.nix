@@ -115,6 +115,8 @@ class SandboxBuildSpec:
     rw_files: tuple[str, ...]
     ro_dirs: tuple[str, ...]
     ro_files: tuple[str, ...]
+    # Unexpanded too, and defaulted to "$PWD" by mkSandbox.
+    workspace_dir: str
     # Keys only. The values are shell expressions the stub resolves; they
     # never enter this process.
     env_keys: tuple[str, ...]
@@ -159,6 +161,7 @@ class _CommonBuildSpec(TypedDict):
     rw_files: tuple[str, ...]
     ro_dirs: tuple[str, ...]
     ro_files: tuple[str, ...]
+    workspace_dir: str
     env_keys: tuple[str, ...]
     allowed_endpoints: tuple[str, ...]
     local_ports: tuple[PortRange, ...] | None
@@ -200,6 +203,7 @@ def _common_build_spec(data: Mapping[str, Any]) -> _CommonBuildSpec:
         rw_files=tuple(data["rw_files"]),
         ro_dirs=tuple(data["ro_dirs"]),
         ro_files=tuple(data["ro_files"]),
+        workspace_dir=data["workspace_dir"],
         env_keys=tuple(data["env_keys"]),
         allowed_endpoints=tuple(data["allowed_endpoints"]),
         local_ports=local_ports,
