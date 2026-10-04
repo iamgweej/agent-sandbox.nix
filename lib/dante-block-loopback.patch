@@ -1,0 +1,81 @@
+--- a/lib/socket.c
++++ b/lib/socket.c
+@@ -46,7 +46,55 @@
+ 
+ static const char rcsid[] =
+ "$Id: socket.c,v 1.218.4.7.2.7.4.3 2020/11/11 16:11:54 karls Exp $";
++
++#if !SOCKS_CLIENT
++/*
++ * agent-sandbox.nix: sockd runs on the host, outside the sandbox, so an
++ * allowed name that resolves to loopback would reach host-local services
++ * the sandbox's own firewall refuses, and one that resolves to link-local
++ * would reach cloud metadata. Checked on the address about to be dialed,
++ * so it holds however the name resolved.
++ */
++static int
++sandbox_blockedipv4(const struct in_addr *addr)
++{
++   const uint32_t a = ntohl(addr->s_addr);
++
++   return (a >> 24) == 127      /* 127.0.0.0/8, loopback.       */
++   ||     (a >> 24) == 0        /* 0.0.0.0/8, "this host".      */
++   ||     (a >> 16) == 0xa9fe;  /* 169.254.0.0/16, link-local.  */
++}
++
++static int
++sandbox_blockedaddr(const sockshost_t *host)
++{
++   static const unsigned char zero[10];
++   const unsigned char *b;
++   struct in_addr v4;
++
++   if (host->atype == SOCKS_ADDR_IPV4)
++      return sandbox_blockedipv4(&host->addr.ipv4);
++
++   b = host->addr.ipv6.ip.s6_addr;
++
++   if (b[0] == 0xfe && (b[1] & 0xc0) == 0x80) /* fe80::/10, link-local. */
++      return 1;
+ 
++   /*
++    * ::/96 (::, ::1, IPv4-compatible) and ::ffff:0:0/96 (IPv4-mapped)
++    * carry an IPv4 address in the last four bytes; :: and ::1 land in
++    * 0.0.0.0/8.
++    */
++   if (memcmp(b, zero, sizeof(zero)) == 0
++   && ((b[10] == 0x00 && b[11] == 0x00) || (b[10] == 0xff && b[11] == 0xff))) {
++      memcpy(&v4.s_addr, b + 12, sizeof(v4.s_addr));
++      return sandbox_blockedipv4(&v4);
++   }
++
++   return 0;
++}
++#endif /* !SOCKS_CLIENT */
++
+ int
+ socks_connecthost(s,
+ #if !SOCKS_CLIENT
+@@ -132,6 +180,22 @@
+       case SOCKS_ADDR_IPV6: {
+          int connect_errno, flags, changed_to_nonblocking;
+ 
++#if !SOCKS_CLIENT
++         /*
++          * EHOSTUNREACH, so a name that also resolves to an allowed
++          * address goes on to try it.
++          */
++         if (side == EXTERNALIF && sandbox_blockedaddr(host)) {
++            snprintf(emsg, emsglen,
++                     "connect(2) to %s refused: loopback and link-local "
++                     "destinations are blocked",
++                     hoststr);
++
++            errno = EHOSTUNREACH;
++            return -1;
++         }
++#endif /* !SOCKS_CLIENT */
++
+          changed_to_nonblocking = 0;
+          flags                  = -1;
+ 

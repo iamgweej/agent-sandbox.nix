@@ -58,7 +58,7 @@ let
       null
     else
       {
-        sockd = "${pkgs.dante}/bin/sockd";
+        sockd = "${shared.dante}/bin/sockd";
         privoxy = "${pkgs.privoxy}/bin/privoxy";
         dante_rules_file = "${shared.mkDanteRules allowedEndpoints}";
       };

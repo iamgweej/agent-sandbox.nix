@@ -17,6 +17,12 @@ let
           --add-flags "--noprofile"
         ln -s bash $out/bin/sh
       '';
+  # sockd runs on the host, so an allowed name resolving to loopback or
+  # link-local would reach what the sandbox's firewall refuses. The patch
+  # refuses those addresses at connect time, after resolution.
+  dante = pkgs.dante.overrideAttrs (old: {
+    patches = (old.patches or [ ]) ++ [ ./dante-block-loopback.patch ];
+  });
   # Shared by the endpoint and published-port validators.
   validPort = port: builtins.isInt port && port >= 1 && port <= 65535;
 
@@ -422,6 +428,7 @@ let
 in
 {
   bashWrapper = bashWrapper;
+  dante = dante;
   assertNoLegacyArgs = assertNoLegacyArgs;
   validateAllowedEndpoints = validateAllowedEndpoints;
   isOpenNetwork = isOpenNetwork;
